@@ -59,4 +59,4 @@ python app.py        # http://localhost:8000
 
 ## License
 
-MIT (or whatever you prefer — pick one before publishing).
+MIT — see [LICENSE](LICENSE).
