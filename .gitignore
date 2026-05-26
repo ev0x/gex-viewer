@@ -1,0 +1,23 @@
+# Claude Code local state (CLAUDE.md is committed; settings.local.json is per-user)
+.claude/
+
+# Conversation exports
+*-is-this-data-useable-*.txt
+2026-*-*.txt
+*.conversation.txt
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp

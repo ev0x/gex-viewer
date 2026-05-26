@@ -1,0 +1,214 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>{{ sym }} Gamma Exposure</title>
+  <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+  <style>
+    body { font-family: -apple-system, system-ui, sans-serif; margin: 16px; background:#0d1117; color:#e6edf3; }
+    h1 { margin: 0 0 4px 0; font-size: 18px; }
+    .meta { color:#8b949e; font-size: 12px; margin-bottom: 12px; }
+    .controls { margin-bottom: 12px; display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+    select, input { background:#161b22; color:#e6edf3; border:1px solid #30363d; padding:4px 8px; }
+    button { background:#238636; color:#fff; border:0; padding:5px 12px; cursor:pointer; border-radius:3px; }
+    button.alt { background:#21262d; border:1px solid #30363d; }
+    #chart { width: 100%; height: 60vh; }
+    #flip { color:#f0883e; font-weight:bold; }
+    .export { margin-top: 16px; background:#161b22; border:1px solid #30363d; padding:10px; border-radius:6px; }
+    .export-head { display:flex; justify-content:space-between; align-items:center; margin-bottom:6px; }
+    .export-head strong { color:#58a6ff; }
+    #tv { width:100%; min-height:80px; font-family: ui-monospace, Menlo, monospace; font-size:12px;
+          background:#0d1117; color:#e6edf3; border:1px solid #30363d; border-radius:4px; padding:8px; resize:vertical; }
+    .pills { display:flex; gap:6px; flex-wrap:wrap; margin-top:8px; font-size:12px; }
+    .pill { background:#21262d; padding:3px 8px; border-radius:10px; border:1px solid #30363d; }
+    .pill b { color:#3fb950; }
+    .pill.red b { color:#f85149; }
+    .pill.amber b { color:#f0883e; }
+    .symbol-hints { font-size:11px; color:#8b949e; }
+  </style>
+</head>
+<body>
+  <h1>{{ sym }} Gamma Exposure</h1>
+  <div class="meta" id="meta">loading…</div>
+  <div class="controls">
+    <span>Symbol:</span>
+    <input id="sym" value="{{ sym }}" style="width:80px;text-transform:uppercase">
+    <button id="go">Load</button>
+    <span class="symbol-hints">ES→SPX, NQ→NDX, RTY→RUT, VX→VIX, YM→DJX · or any stock ticker</span>
+    <span style="margin-left:12px">Expiry:</span> <select id="expiry"></select>
+    <span>View:</span>
+    <select id="view">
+      <option value="net">Net GEX by strike</option>
+      <option value="split">Calls vs Puts (signed)</option>
+      <option value="gamma">Raw gamma · OI</option>
+    </select>
+    <span id="flip"></span>
+  </div>
+
+  <div class="pills" id="pills"></div>
+  <div id="chart"></div>
+
+  <div class="export">
+    <div class="export-head">
+      <strong>TradingView import string</strong>
+      <span>
+        <button id="copy" class="alt">Copy</button>
+        <span id="copied" style="color:#3fb950; font-size:12px; margin-left:8px"></span>
+      </span>
+    </div>
+    <textarea id="tv" readonly></textarea>
+    <div class="symbol-hints" style="margin-top:6px">
+      Paste into TradingView's "Add levels from text" / Pine input. 0DTE values fall back to nearest expiry if today has none. 1D Min/Max = spot ± 1σ from iv30.
+    </div>
+  </div>
+
+<script>
+let DATA = null;
+
+async function load() {
+  document.getElementById('meta').textContent = 'loading…';
+  const sym = document.getElementById('sym').value.trim().toUpperCase() || '{{ sym }}';
+  const r = await fetch('/api/gex/' + sym);
+  if (!r.ok) {
+    document.getElementById('meta').textContent = `error fetching ${sym} (${r.status})`;
+    return;
+  }
+  DATA = await r.json();
+
+  const lv = DATA.levels || {};
+  document.getElementById('meta').textContent =
+    `${DATA.user_symbol} (upstream ${DATA.upstream_symbol}) · spot ${DATA.spot} · iv30 ${DATA.iv30}% · ts ${DATA.timestamp} · ${DATA.rows.length} contracts`;
+
+  document.getElementById('pills').innerHTML = [
+    ['Spot', DATA.spot],
+    ['Call Resistance', lv.call_resistance, ''],
+    ['Put Support', lv.put_support, 'red'],
+    ['HVL', lv.hvl, 'amber'],
+    ['1D Min', lv.one_day_min, 'red'],
+    ['1D Max', lv.one_day_max, ''],
+    ['Call Res 0DTE', lv.call_resistance_0dte, ''],
+    ['Put Sup 0DTE', lv.put_support_0dte, 'red'],
+    ['HVL 0DTE', lv.hvl_0dte, 'amber'],
+    ['Gamma Wall 0DTE', lv.gamma_wall_0dte, 'amber'],
+  ].filter(([_, v]) => v !== undefined && v !== null)
+   .map(([k, v, cls]) => `<span class="pill ${cls||''}">${k} <b>${v}</b></span>`)
+   .join('');
+
+  document.getElementById('tv').value = DATA.tv_string || '';
+
+  const expiries = [...new Set(DATA.rows.map(x => x.expiry))].sort();
+  const today = new Date().toISOString().slice(0, 10);
+  const nearest = expiries.find(e => e >= today) || expiries[0];
+  const sel = document.getElementById('expiry');
+  sel.innerHTML = expiries.map(e => {
+    const label = e === nearest ? `0DTE — ${e}` :
+                  `${e} (${Math.round((Date.parse(e) - Date.parse(today)) / 86400000)}DTE)`;
+    return `<option value="${e}"${e === nearest ? ' selected' : ''}>${label}</option>`;
+  }).join('') + '<option value="ALL">ALL</option>';
+
+  draw();
+}
+
+function draw() {
+  if (!DATA) return;
+  const expiry = document.getElementById('expiry').value;
+  const view = document.getElementById('view').value;
+  render(DATA.rows, expiry, view);
+}
+
+function render(rows, expiry, view) {
+  const f = expiry === 'ALL' ? rows : rows.filter(r => r.expiry === expiry);
+  const byStrike = new Map();
+  for (const r of f) {
+    if (!byStrike.has(r.strike)) byStrike.set(r.strike, {c:0, p:0, cg:0, pg:0});
+    const b = byStrike.get(r.strike);
+    if (r.right === 'C') { b.c += r.gex; b.cg += r.gamma * r.oi; }
+    else { b.p += r.gex; b.pg += r.gamma * r.oi; }
+  }
+  const strikes = [...byStrike.keys()].sort((a,b)=>a-b);
+  const calls = strikes.map(s => byStrike.get(s).c);
+  const puts  = strikes.map(s => byStrike.get(s).p);
+  const net   = strikes.map((s,i) => calls[i] + puts[i]);
+  const rawC  = strikes.map(s => byStrike.get(s).cg);
+  const rawP  = strikes.map(s => byStrike.get(s).pg);
+
+  let cum = 0, flip = null;
+  for (let i=0;i<strikes.length;i++){
+    const prev = cum; cum += net[i];
+    if (flip === null && prev !== 0 && Math.sign(prev) !== Math.sign(cum)) flip = strikes[i];
+  }
+  document.getElementById('flip').textContent = flip ? `gamma flip ≈ ${flip}` : '';
+
+  let traces;
+  if (view === 'net') {
+    traces = [{
+      type:'bar', x: strikes, y: net,
+      marker:{ color: net.map(v => v>=0 ? '#3fb950' : '#f85149') },
+      name:'Net GEX'
+    }];
+  } else if (view === 'split') {
+    traces = [
+      { type:'bar', x: strikes, y: calls, name:'Calls', marker:{color:'#3fb950'} },
+      { type:'bar', x: strikes, y: puts,  name:'Puts',  marker:{color:'#f85149'} },
+    ];
+  } else {
+    traces = [
+      { type:'bar', x: strikes, y: rawC, name:'Call γ·OI', marker:{color:'#58a6ff'} },
+      { type:'bar', x: strikes, y: rawP, name:'Put γ·OI',  marker:{color:'#d2a8ff'} },
+    ];
+  }
+
+  const shapes = [];
+  if (flip) shapes.push({type:'line', x0:flip, x1:flip, yref:'paper', y0:0, y1:1,
+                         line:{color:'#f0883e', dash:'dash'}});
+  if (DATA.spot) shapes.push({type:'line', x0:DATA.spot, x1:DATA.spot, yref:'paper', y0:0, y1:1,
+                              line:{color:'#58a6ff', dash:'dot', width:2}});
+
+  // Auto-zoom: keep 99% of |GEX| mass
+  const mass = strikes.map((s,i) => Math.abs(calls[i]) + Math.abs(puts[i]));
+  const total = mass.reduce((a,b)=>a+b,0);
+  let xrange = null;
+  if (total > 0) {
+    let lo = 0, hi = strikes.length - 1, cm = 0;
+    while (lo < hi && cm + mass[lo] < total * 0.005) { cm += mass[lo]; lo++; }
+    cm = 0;
+    while (hi > lo && cm + mass[hi] < total * 0.005) { cm += mass[hi]; hi--; }
+    const pad = (strikes[hi] - strikes[lo]) * 0.05 || 5;
+    xrange = [strikes[lo] - pad, strikes[hi] + pad];
+  }
+
+  Plotly.newPlot('chart', traces, {
+    barmode: 'relative',
+    paper_bgcolor:'#0d1117', plot_bgcolor:'#0d1117',
+    font:{color:'#e6edf3'},
+    xaxis:{title:'Strike', gridcolor:'#21262d', range: xrange},
+    yaxis:{title: view==='gamma' ? 'gamma · OI' : 'GEX (gamma · OI · 100, signed)',
+           gridcolor:'#21262d', zerolinecolor:'#30363d'},
+    shapes,
+    margin:{t:10,r:10,b:50,l:70},
+    showlegend: view !== 'net',
+  }, {displaylogo:false, responsive:true});
+}
+
+document.getElementById('go').onclick = () => {
+  const s = document.getElementById('sym').value.trim().toUpperCase();
+  if (s) location.pathname = '/' + s;
+};
+document.getElementById('sym').addEventListener('keydown', e => {
+  if (e.key === 'Enter') document.getElementById('go').click();
+});
+document.getElementById('expiry').onchange = draw;
+document.getElementById('view').onchange = draw;
+document.getElementById('copy').onclick = async () => {
+  const ta = document.getElementById('tv');
+  ta.select();
+  try { await navigator.clipboard.writeText(ta.value); }
+  catch { document.execCommand('copy'); }
+  document.getElementById('copied').textContent = 'copied ✓';
+  setTimeout(() => document.getElementById('copied').textContent = '', 1500);
+};
+
+load();
+</script>
+</body>
+</html>
