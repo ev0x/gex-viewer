@@ -2,39 +2,62 @@
 <html>
 <head>
   <meta charset="utf-8">
-  <title>{{ sym }} Gamma Exposure</title>
+  <title>{{ sym }} Gamma Levels</title>
   <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
   <style>
     body { font-family: -apple-system, system-ui, sans-serif; margin: 16px; background:#0d1117; color:#e6edf3; }
     h1 { margin: 0 0 4px 0; font-size: 18px; }
     .meta { color:#8b949e; font-size: 12px; margin-bottom: 12px; }
-    .controls { margin-bottom: 12px; display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+    .controls { margin-bottom: 8px; display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
     select, input { background:#161b22; color:#e6edf3; border:1px solid #30363d; padding:4px 8px; }
     button { background:#238636; color:#fff; border:0; padding:5px 12px; cursor:pointer; border-radius:3px; }
     button.alt { background:#21262d; border:1px solid #30363d; }
-    #chart { width: 100%; height: 60vh; }
+    #chart { width: 100%; height: 75vh; }
     #flip { color:#f0883e; font-weight:bold; }
     .export { margin-top: 16px; background:#161b22; border:1px solid #30363d; padding:10px; border-radius:6px; }
     .export-head { display:flex; justify-content:space-between; align-items:center; margin-bottom:6px; }
     .export-head strong { color:#58a6ff; }
     #tv { width:100%; min-height:80px; font-family: ui-monospace, Menlo, monospace; font-size:12px;
           background:#0d1117; color:#e6edf3; border:1px solid #30363d; border-radius:4px; padding:8px; resize:vertical; }
-    .pills { display:flex; gap:6px; flex-wrap:wrap; margin-top:8px; font-size:12px; }
+    .pills { display:flex; gap:6px; flex-wrap:wrap; margin:8px 0 12px; font-size:12px; }
     .pill { background:#21262d; padding:3px 8px; border-radius:10px; border:1px solid #30363d; }
     .pill b { color:#3fb950; }
     .pill.red b { color:#f85149; }
     .pill.amber b { color:#f0883e; }
-    .symbol-hints { font-size:11px; color:#8b949e; }
+    .pill.blue b { color:#58a6ff; }
+    .hint { font-size:11px; color:#8b949e; }
+    .hidden { display:none !important; }
   </style>
 </head>
 <body>
-  <h1>{{ sym }} Gamma Exposure</h1>
+  <h1>{{ sym }} Gamma Levels</h1>
   <div class="meta" id="meta">loading…</div>
+
   <div class="controls">
     <span>Symbol:</span>
     <input id="sym" value="{{ sym }}" style="width:80px;text-transform:uppercase">
     <button id="go">Load</button>
-    <span class="symbol-hints">ES→SPX, NQ→NDX, RTY→RUT, VX→VIX, YM→DJX · or any stock ticker</span>
+    <span style="margin-left:12px">Source:</span>
+    <select id="source">
+      <option value="menthorq"{% if default_source == 'menthorq' %} selected{% endif %}>MenthorQ (precomputed levels)</option>
+      <option value="gexapi"{% if default_source == 'gexapi' %} selected{% endif %}>GEX API (raw chain + histogram)</option>
+    </select>
+  </div>
+
+  <!-- MenthorQ-only controls -->
+  <div class="controls" id="mqControls">
+    <span>Level type:</span>
+    <select id="lt">
+      {% for lt in level_types %}
+        <option value="{{ lt }}"{% if lt == default_level_type %} selected{% endif %}>{{ lt }}</option>
+      {% endfor %}
+    </select>
+    <span class="hint">SPY, ES, NQ, RTY, VX, YM, or any MenthorQ-supported ticker. Ticker is returned in TV format (e.g. <code>$ES1!</code>).</span>
+  </div>
+
+  <!-- GEX-API-only controls -->
+  <div class="controls hidden" id="gxControls">
+    <span class="hint">ES→SPX, NQ→NDX, RTY→RUT, VX→VIX, YM→DJX · or any stock ticker</span>
     <span style="margin-left:12px">Expiry:</span> <select id="expiry"></select>
     <span>View:</span>
     <select id="view">
@@ -42,6 +65,14 @@
       <option value="split">Calls vs Puts (signed)</option>
       <option value="gamma">Raw gamma · OI</option>
     </select>
+    <span>Orientation:</span>
+    <select id="orient">
+      <option value="h" selected>Horizontal</option>
+      <option value="v">Vertical</option>
+    </select>
+    <label style="display:flex;align-items:center;gap:4px">
+      <input type="checkbox" id="tvonly"> TV levels only
+    </label>
     <span id="flip"></span>
   </div>
 
@@ -57,29 +88,185 @@
       </span>
     </div>
     <textarea id="tv" readonly></textarea>
-    <div class="symbol-hints" style="margin-top:6px">
-      Paste into TradingView's "Add levels from text" / Pine input. 0DTE values fall back to nearest expiry if today has none. 1D Min/Max = spot ± 1σ from iv30.
+    <div class="hint" style="margin-top:6px">
+      MenthorQ ships ticker already in TV format (no index↔futures basis fix needed). GEX API mode uses cash-index strikes
+      with the futures TV ticker, so an offset may apply.
     </div>
   </div>
 
 <script>
 let DATA = null;
+let MODE = '{{ default_source }}';
+const DEFAULT_SYM = '{{ sym }}';
+
+const $ = id => document.getElementById(id);
+
+function applyMode() {
+  MODE = $('source').value;
+  $('mqControls').classList.toggle('hidden', MODE !== 'menthorq');
+  $('gxControls').classList.toggle('hidden', MODE !== 'gexapi');
+}
 
 async function load() {
-  document.getElementById('meta').textContent = 'loading…';
-  const sym = document.getElementById('sym').value.trim().toUpperCase() || '{{ sym }}';
-  const r = await fetch('/api/gex/' + sym);
+  applyMode();
+  $('meta').textContent = 'loading…';
+  $('pills').innerHTML = '';
+  $('tv').value = '';
+  Plotly.purge('chart');
+
+  const sym = $('sym').value.trim().toUpperCase() || DEFAULT_SYM;
+  if (MODE === 'menthorq') return loadMenthorQ(sym);
+  return loadGexApi(sym);
+}
+
+// ============== MenthorQ ==============================================
+
+async function loadMenthorQ(sym) {
+  const lt = $('lt').value;
+  const r = await fetch(`/api/levels/${sym}?level_type=${lt}`);
   if (!r.ok) {
-    document.getElementById('meta').textContent = `error fetching ${sym} (${r.status})`;
+    let msg = `error fetching ${sym} (${r.status})`;
+    try { const j = await r.json(); if (j.message) msg += ` — ${j.message}`; } catch {}
+    $('meta').textContent = msg;
     return;
   }
   DATA = await r.json();
 
+  $('meta').textContent =
+    `${DATA.ticker} (TV: ${DATA.ticker_mq}) · ${DATA.level_type} · ${DATA.kind} · ${DATA.date} · ${DATA.level_values.length} levels`
+    + (DATA.spot != null ? ` · spot ≈ ${DATA.spot}` : '');
+
+  renderMqPills();
+  $('tv').value = DATA.tv_string || '';
+  renderMqChart();
+}
+
+function mqPillClass(name) {
+  if (/Put Sup|1D Min|^LB /.test(name)) return 'red';
+  if (/HVL|^RT /.test(name)) return 'amber';
+  if (/Gamma Wall|^BL /.test(name)) return 'blue';
+  return '';
+}
+
+function renderMqPills() {
+  const named = [], gex = [], bl = [];
+  for (const lv of DATA.level_values) {
+    if (/^GEX \d+$/.test(lv.name)) gex.push(lv);
+    else if (/^BL \d+$/.test(lv.name)) bl.push(lv);
+    else named.push(lv);
+  }
+  const html = named.map(lv =>
+    `<span class="pill ${mqPillClass(lv.name)}">${lv.name} <b>${lv.value}</b></span>`
+  );
+  if (gex.length) html.push(`<span class="pill">GEX 1–${gex.length}</span>`);
+  if (bl.length)  html.push(`<span class="pill blue">BL 1–${bl.length}</span>`);
+  $('pills').innerHTML = html.join('');
+}
+
+function mqColorFor(name) {
+  if (/^Call Resistance/.test(name)) return '#3fb950';
+  if (/^Put Support/.test(name))     return '#f85149';
+  if (/^HVL/.test(name))             return '#f0883e';
+  if (/^Gamma Wall/.test(name))      return '#58a6ff';
+  if (name === '1D Max')             return '#3fb950';
+  if (name === '1D Min')             return '#f85149';
+  if (/^GEX /.test(name))            return '#8b949e';
+  if (/^BL /.test(name))             return '#bc8cff';
+  if (/^UB /.test(name))             return '#3fb950';
+  if (/^LB /.test(name))             return '#f85149';
+  if (/^RT /.test(name))             return '#f0883e';
+  return '#8b949e';
+}
+
+function mqDashFor(name) {
+  if (/0DTE/.test(name)) return 'dash';
+  if (name === '1D Max' || name === '1D Min') return 'dot';
+  if (/^GEX /.test(name) || /^BL /.test(name)) return 'dot';
+  return 'solid';
+}
+
+function mqWidthFor(name) {
+  if (/^(Call Resistance|Put Support|HVL)$/.test(name)) return 2.5;
+  if (/^Gamma Wall 0DTE$/.test(name)) return 2;
+  if (/^GEX |^BL /.test(name)) return 1;
+  return 1.5;
+}
+
+function renderMqChart() {
+  if (!DATA || !DATA.level_values || !DATA.level_values.length) return;
+  const lvs = DATA.level_values.filter(l => l.value != null);
+  const values = lvs.map(l => l.value);
+  if (DATA.spot != null) values.push(DATA.spot);
+  const lo = Math.min(...values);
+  const hi = Math.max(...values);
+  const pad = (hi - lo) * 0.05 || Math.max(1, hi * 0.005);
+
+  const shapes = lvs.map(lv => ({
+    type: 'line', xref: 'paper', x0: 0, x1: 1, y0: lv.value, y1: lv.value,
+    line: { color: mqColorFor(lv.name), dash: mqDashFor(lv.name), width: mqWidthFor(lv.name) },
+  }));
+  if (DATA.spot != null) {
+    shapes.push({ type: 'line', xref: 'paper', x0: 0, x1: 1, y0: DATA.spot, y1: DATA.spot,
+                  line: { color: '#e6edf3', dash: 'dashdot', width: 1 } });
+  }
+
+  const seen = new Map();
+  const annotations = lvs.map(lv => {
+    const slot = seen.get(lv.value) || 0;
+    seen.set(lv.value, slot + 1);
+    return {
+      x: 1 - slot * 0.12, xref: 'paper', xanchor: 'right',
+      y: lv.value, yref: 'y', yanchor: 'middle',
+      text: ` ${lv.name} ${lv.value} `, showarrow: false,
+      font: { color: mqColorFor(lv.name), size: 11 },
+      bgcolor: 'rgba(13,17,23,0.85)',
+    };
+  });
+  if (DATA.spot != null) {
+    annotations.push({
+      x: 0, xref: 'paper', xanchor: 'left', y: DATA.spot, yref: 'y', yanchor: 'middle',
+      text: ` spot ≈ ${DATA.spot} `, showarrow: false,
+      font: { color: '#e6edf3', size: 11 }, bgcolor: 'rgba(13,17,23,0.85)',
+    });
+  }
+
+  const trace = {
+    type: 'scatter', mode: 'markers',
+    x: lvs.map(_ => 0.5), y: lvs.map(l => l.value),
+    text: lvs.map(l => l.name),
+    marker: { size: 6, color: lvs.map(l => mqColorFor(l.name)), opacity: 0.6 },
+    hovertemplate: '%{text}: %{y}<extra></extra>',
+  };
+
+  Plotly.newPlot('chart', [trace], {
+    paper_bgcolor: '#0d1117', plot_bgcolor: '#0d1117', font: { color: '#e6edf3' },
+    xaxis: { visible: false, range: [0, 1], fixedrange: true },
+    yaxis: { title: 'Strike', gridcolor: '#21262d', range: [lo - pad, hi + pad] },
+    shapes, annotations,
+    margin: { t: 10, r: 20, b: 50, l: 80 },
+    showlegend: false,
+  }, { displaylogo: false, responsive: true });
+}
+
+// ============== GEX-API (raw chain → histogram) =======================
+
+async function loadGexApi(sym) {
+  const r = await fetch('/api/gex/' + sym);
+  if (!r.ok) {
+    $('meta').textContent = `error fetching ${sym} (${r.status})`;
+    return;
+  }
+  DATA = await r.json();
+  if (DATA.error) {
+    $('meta').textContent = `error: gex-api returned an error for ${sym}`;
+    return;
+  }
+
   const lv = DATA.levels || {};
-  document.getElementById('meta').textContent =
+  $('meta').textContent =
     `${DATA.user_symbol} (upstream ${DATA.upstream_symbol}) · spot ${DATA.spot} · iv30 ${DATA.iv30}% · ts ${DATA.timestamp} · ${DATA.rows.length} contracts`;
 
-  document.getElementById('pills').innerHTML = [
+  $('pills').innerHTML = [
     ['Spot', DATA.spot],
     ['Call Resistance', lv.call_resistance, ''],
     ['Put Support', lv.put_support, 'red'],
@@ -94,30 +281,47 @@ async function load() {
    .map(([k, v, cls]) => `<span class="pill ${cls||''}">${k} <b>${v}</b></span>`)
    .join('');
 
-  document.getElementById('tv').value = DATA.tv_string || '';
+  $('tv').value = DATA.tv_string || '';
 
   const expiries = [...new Set(DATA.rows.map(x => x.expiry))].sort();
   const today = new Date().toISOString().slice(0, 10);
   const nearest = expiries.find(e => e >= today) || expiries[0];
-  const sel = document.getElementById('expiry');
+  const sel = $('expiry');
   sel.innerHTML = expiries.map(e => {
     const label = e === nearest ? `0DTE — ${e}` :
                   `${e} (${Math.round((Date.parse(e) - Date.parse(today)) / 86400000)}DTE)`;
     return `<option value="${e}"${e === nearest ? ' selected' : ''}>${label}</option>`;
   }).join('') + '<option value="ALL">ALL</option>';
 
-  draw();
+  drawGex();
 }
 
-function draw() {
-  if (!DATA) return;
-  const expiry = document.getElementById('expiry').value;
-  const view = document.getElementById('view').value;
-  render(DATA.rows, expiry, view);
+function drawGex() {
+  if (!DATA || MODE !== 'gexapi') return;
+  const expiry = $('expiry').value;
+  const view = $('view').value;
+  const orient = $('orient').value;
+  const tvOnly = $('tvonly').checked;
+  renderGex(DATA.rows, expiry, view, orient, tvOnly);
 }
 
-function render(rows, expiry, view) {
-  const f = expiry === 'ALL' ? rows : rows.filter(r => r.expiry === expiry);
+function tvLevelSet() {
+  const lv = DATA && DATA.levels;
+  if (!lv) return null;
+  const set = new Set();
+  ['call_resistance','put_support','hvl',
+   'call_resistance_0dte','put_support_0dte','hvl_0dte','gamma_wall_0dte']
+    .forEach(k => { if (lv[k] != null) set.add(lv[k]); });
+  (lv.gex_ranked || []).forEach(s => set.add(s));
+  return set;
+}
+
+function renderGex(rows, expiry, view, orient, tvOnly) {
+  let f = expiry === 'ALL' ? rows : rows.filter(r => r.expiry === expiry);
+  if (tvOnly) {
+    const keep = tvLevelSet();
+    if (keep) f = f.filter(r => keep.has(r.strike));
+  }
   const byStrike = new Map();
   for (const r of f) {
     if (!byStrike.has(r.strike)) byStrike.set(r.strike, {c:0, p:0, cg:0, pg:0});
@@ -137,77 +341,117 @@ function render(rows, expiry, view) {
     const prev = cum; cum += net[i];
     if (flip === null && prev !== 0 && Math.sign(prev) !== Math.sign(cum)) flip = strikes[i];
   }
-  document.getElementById('flip').textContent = flip ? `gamma flip ≈ ${flip}` : '';
+  $('flip').textContent = flip ? `gamma flip ≈ ${flip}` : '';
+
+  const h = orient === 'h';
+  const mkTrace = (vals, name, color) => h
+    ? { type:'bar', orientation:'h', y: strikes, x: vals, name, marker:{color} }
+    : { type:'bar', x: strikes, y: vals, name, marker:{color} };
 
   let traces;
   if (view === 'net') {
-    traces = [{
-      type:'bar', x: strikes, y: net,
-      marker:{ color: net.map(v => v>=0 ? '#3fb950' : '#f85149') },
-      name:'Net GEX'
-    }];
+    const colors = net.map(v => v>=0 ? '#3fb950' : '#f85149');
+    traces = [ h
+      ? { type:'bar', orientation:'h', y: strikes, x: net, marker:{color:colors}, name:'Net GEX' }
+      : { type:'bar', x: strikes, y: net, marker:{color:colors}, name:'Net GEX' }
+    ];
   } else if (view === 'split') {
-    traces = [
-      { type:'bar', x: strikes, y: calls, name:'Calls', marker:{color:'#3fb950'} },
-      { type:'bar', x: strikes, y: puts,  name:'Puts',  marker:{color:'#f85149'} },
-    ];
+    traces = [ mkTrace(calls, 'Calls', '#3fb950'), mkTrace(puts, 'Puts', '#f85149') ];
   } else {
-    traces = [
-      { type:'bar', x: strikes, y: rawC, name:'Call γ·OI', marker:{color:'#58a6ff'} },
-      { type:'bar', x: strikes, y: rawP, name:'Put γ·OI',  marker:{color:'#d2a8ff'} },
-    ];
+    traces = [ mkTrace(rawC, 'Call γ·OI', '#58a6ff'), mkTrace(rawP, 'Put γ·OI', '#d2a8ff') ];
   }
 
-  const shapes = [];
-  if (flip) shapes.push({type:'line', x0:flip, x1:flip, yref:'paper', y0:0, y1:1,
-                         line:{color:'#f0883e', dash:'dash'}});
-  if (DATA.spot) shapes.push({type:'line', x0:DATA.spot, x1:DATA.spot, yref:'paper', y0:0, y1:1,
-                              line:{color:'#58a6ff', dash:'dot', width:2}});
+  const refLine = (at, color, dash, width=1) => h
+    ? { type:'line', xref:'paper', x0:0, x1:1, y0:at, y1:at, line:{color, dash, width} }
+    : { type:'line', yref:'paper', y0:0, y1:1, x0:at, x1:at, line:{color, dash, width} };
 
-  // Auto-zoom: keep 99% of |GEX| mass
+  const shapes = [];
+  if (flip)      shapes.push(refLine(flip,      '#f0883e', 'dash'));
+  if (DATA.spot) shapes.push(refLine(DATA.spot, '#58a6ff', 'dot', 2));
+
   const mass = strikes.map((s,i) => Math.abs(calls[i]) + Math.abs(puts[i]));
   const total = mass.reduce((a,b)=>a+b,0);
-  let xrange = null;
+  let strikeRange = null;
   if (total > 0) {
     let lo = 0, hi = strikes.length - 1, cm = 0;
     while (lo < hi && cm + mass[lo] < total * 0.005) { cm += mass[lo]; lo++; }
     cm = 0;
     while (hi > lo && cm + mass[hi] < total * 0.005) { cm += mass[hi]; hi--; }
     const pad = (strikes[hi] - strikes[lo]) * 0.05 || 5;
-    xrange = [strikes[lo] - pad, strikes[hi] + pad];
+    strikeRange = [strikes[lo] - pad, strikes[hi] + pad];
   }
+
+  const annotations = [];
+  if (DATA.levels && strikeRange) {
+    const lv = DATA.levels;
+    const inRange = s => s != null && s >= strikeRange[0] && s <= strikeRange[1];
+    const addLbl = (s, text, color) => {
+      if (!inRange(s)) return;
+      annotations.push(h
+        ? { x: 0.02, xref:'paper', xanchor:'left', y: s, yref:'y', yanchor:'middle',
+            text, showarrow:false, font:{color, size:11}, bgcolor:'rgba(13,17,23,0.7)' }
+        : { x: s, xref:'x', xanchor:'center', y: 0.98, yref:'paper', yanchor:'top',
+            text, showarrow:false, font:{color, size:11}, bgcolor:'rgba(13,17,23,0.7)' }
+      );
+    };
+    addLbl(lv.call_resistance, 'Call Resistance', '#3fb950');
+    addLbl(lv.put_support,     'Put Support',     '#f85149');
+    addLbl(lv.hvl,             'HVL',             '#f0883e');
+  }
+
+  let gexRange = null;
+  if (view !== 'gamma' && strikeRange) {
+    const inVis = i => strikes[i] >= strikeRange[0] && strikes[i] <= strikeRange[1];
+    let m = 0;
+    for (let i = 0; i < strikes.length; i++) {
+      if (!inVis(i)) continue;
+      if (view === 'net') m = Math.max(m, Math.abs(net[i]));
+      else m = Math.max(m, Math.abs(calls[i]), Math.abs(puts[i]));
+    }
+    if (m > 0) gexRange = [-m * 1.05, m * 1.05];
+  }
+
+  const strikeAxis = { title:'Strike', gridcolor:'#21262d', range: strikeRange };
+  const gexAxis    = { title: view==='gamma' ? 'gamma · OI' : 'GEX (gamma · OI · 100, signed)',
+                       gridcolor:'#21262d', zerolinecolor:'#30363d',
+                       range: gexRange, nticks: 14 };
 
   Plotly.newPlot('chart', traces, {
     barmode: 'relative',
-    paper_bgcolor:'#0d1117', plot_bgcolor:'#0d1117',
-    font:{color:'#e6edf3'},
-    xaxis:{title:'Strike', gridcolor:'#21262d', range: xrange},
-    yaxis:{title: view==='gamma' ? 'gamma · OI' : 'GEX (gamma · OI · 100, signed)',
-           gridcolor:'#21262d', zerolinecolor:'#30363d'},
-    shapes,
-    margin:{t:10,r:10,b:50,l:70},
+    paper_bgcolor:'#0d1117', plot_bgcolor:'#0d1117', font:{color:'#e6edf3'},
+    xaxis: h ? gexAxis    : strikeAxis,
+    yaxis: h ? strikeAxis : gexAxis,
+    shapes, annotations,
+    margin:{t:10,r:10,b:50,l:80},
     showlegend: view !== 'net',
   }, {displaylogo:false, responsive:true});
 }
 
-document.getElementById('go').onclick = () => {
-  const s = document.getElementById('sym').value.trim().toUpperCase();
+// ============== Wiring ===============================================
+
+$('go').onclick = () => {
+  const s = $('sym').value.trim().toUpperCase();
   if (s) location.pathname = '/' + s;
 };
-document.getElementById('sym').addEventListener('keydown', e => {
-  if (e.key === 'Enter') document.getElementById('go').click();
+$('sym').addEventListener('keydown', e => {
+  if (e.key === 'Enter') $('go').click();
 });
-document.getElementById('expiry').onchange = draw;
-document.getElementById('view').onchange = draw;
-document.getElementById('copy').onclick = async () => {
-  const ta = document.getElementById('tv');
+$('source').onchange = load;
+$('lt').onchange = load;
+$('expiry').onchange = drawGex;
+$('view').onchange = drawGex;
+$('orient').onchange = drawGex;
+$('tvonly').onchange = drawGex;
+$('copy').onclick = async () => {
+  const ta = $('tv');
   ta.select();
   try { await navigator.clipboard.writeText(ta.value); }
   catch { document.execCommand('copy'); }
-  document.getElementById('copied').textContent = 'copied ✓';
-  setTimeout(() => document.getElementById('copied').textContent = '', 1500);
+  $('copied').textContent = 'copied ✓';
+  setTimeout(() => $('copied').textContent = '', 1500);
 };
 
+applyMode();
 load();
 </script>
 </body>
