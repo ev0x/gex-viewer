@@ -13,6 +13,9 @@ __pycache__/
 .venv/
 venv/
 
+# Logs (post_daily.py cron output)
+*.log
+
 # OS
 .DS_Store
 Thumbs.db

@@ -1,0 +1,70 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Daily TV Levels</title>
+  <style>
+    body { font-family: -apple-system, system-ui, sans-serif; margin: 16px; background:#0d1117; color:#e6edf3; max-width: 1100px; }
+    h1 { margin: 0 0 4px 0; font-size: 18px; }
+    h2 { margin: 0 0 8px 0; font-size: 15px; color:#f0883e; }
+    .meta { color:#8b949e; font-size: 12px; margin-bottom: 16px; }
+    .meta a { color:#58a6ff; }
+    button { background:#21262d; color:#e6edf3; border:1px solid #30363d; padding:4px 10px; cursor:pointer; border-radius:3px; font-size:12px; }
+    button.primary { background:#238636; color:#fff; border:0; }
+    .block { background:#161b22; border:1px solid #30363d; border-radius:6px; padding:10px; margin-bottom:10px; }
+    .block-head { display:flex; justify-content:space-between; align-items:center; margin-bottom:6px; }
+    .block-head strong { color:#58a6ff; font-size:14px; }
+    .lt { color:#8b949e; font-size:11px; margin-left:8px; }
+    pre { font-family: ui-monospace, Menlo, monospace; font-size:12px; margin:0;
+          background:#0d1117; border:1px solid #30363d; border-radius:4px; padding:8px;
+          white-space:pre-wrap; word-break:break-all; }
+    pre.err { color:#f85149; }
+    hr { border:0; border-top:1px dashed #30363d; margin:18px 0 12px; }
+    .ok { color:#3fb950; font-size:12px; margin-left:8px; }
+  </style>
+</head>
+<body>
+  <h1>Daily TradingView Levels</h1>
+  <div class="meta">
+    MenthorQ{% if day %} · {{ day }}{% endif %}
+    · <a href="/daily?format=txt">plain text</a>
+    · <button id="copyAll" class="primary">Copy all</button><span id="copiedAll" class="ok"></span>
+  </div>
+
+  {% for sec in sections %}
+    {% if not loop.first %}<hr>{% endif %}
+    {% if sec.title %}<h2>{{ sec.title }}</h2>{% endif %}
+    {% for b in sec.blocks %}
+      <div class="block">
+        <div class="block-head">
+          <span><strong>{{ b.ticker }}</strong><span class="lt">{{ b.level_type }}{% if b.date %} · {{ b.date }}{% endif %}</span></span>
+          <span>{% if b.tv %}<button class="copy">Copy</button>{% endif %}<span class="ok"></span></span>
+        </div>
+        {% if b.tv %}<pre>{{ b.tv }}</pre>{% else %}<pre class="err">error: {{ b.error }}</pre>{% endif %}
+      </div>
+    {% endfor %}
+  {% endfor %}
+
+  <textarea id="fullText" style="display:none">{{ full_text }}</textarea>
+
+<script>
+async function copyText(text, okEl) {
+  try { await navigator.clipboard.writeText(text); }
+  catch {
+    const ta = document.createElement('textarea');
+    ta.value = text; document.body.appendChild(ta);
+    ta.select(); document.execCommand('copy'); ta.remove();
+  }
+  okEl.textContent = 'copied ✓';
+  setTimeout(() => okEl.textContent = '', 1500);
+}
+document.querySelectorAll('.block .copy').forEach(btn => {
+  btn.onclick = () => copyText(
+    btn.closest('.block').querySelector('pre').textContent,
+    btn.parentElement.querySelector('.ok'));
+});
+document.getElementById('copyAll').onclick = () =>
+  copyText(document.getElementById('fullText').value, document.getElementById('copiedAll'));
+</script>
+</body>
+</html>

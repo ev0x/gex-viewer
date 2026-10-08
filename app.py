@@ -2,9 +2,10 @@ import math
 import os
 import re
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date
 
-from flask import Flask, jsonify, render_template, request
+from flask import Flask, Response, jsonify, render_template, request
 import requests
 
 # ---- MenthorQ (precomputed levels) ----------------------------------------
@@ -20,6 +21,12 @@ LEVEL_TYPES = [
     "swing_levels",
 ]
 DEFAULT_LEVEL_TYPE = "gamma_levels"
+
+# /daily page: (section title, level_type, tickers). First section renders untitled.
+DAILY_SECTIONS = [
+    ("", "gamma_levels", ["ES", "NQ", "QQQ", "SPY", "NDX", "SPX"]),
+    ("INTRADAY", "gamma_levels_intraday", ["ES", "NQ"]),
+]
 
 # ---- gex-api (raw option chain) -------------------------------------------
 GEX_UPSTREAM = "https://gex-api-xiq6cw7ltq-ue.a.run.app/delayed_options/{sym}"
@@ -140,6 +147,70 @@ def api_levels(sym):
         "spot": spot,
         "tv_string": build_tv_string_menthorq(ticker_mq, level_values),
     })
+
+
+# =========================================================================
+# /daily — TV import strings for the whole watchlist in one shot
+# =========================================================================
+
+def fetch_daily_block(ticker, level_type):
+    try:
+        payload = fetch_menthorq(ticker, level_type)
+    except requests.RequestException as e:
+        return {"ticker": ticker, "level_type": level_type, "tv": "", "date": None, "error": str(e)}
+    levels = payload.get("levels") or []
+    block = levels[0] if levels else {}
+    tv = build_tv_string_menthorq(
+        payload.get("ticker_mq") or ticker,
+        block.get("level_values") or [],
+    )
+    return {
+        "ticker": ticker,
+        "level_type": level_type,
+        "tv": tv,
+        "date": block.get("date"),
+        "error": None if tv else "no levels returned",
+    }
+
+
+def build_daily_sections():
+    jobs = [(t, lt) for _, lt, tickers in DAILY_SECTIONS for t in tickers]
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        results = list(pool.map(lambda j: fetch_daily_block(*j), jobs))
+    sections, i = [], 0
+    for title, lt, tickers in DAILY_SECTIONS:
+        sections.append({"title": title, "level_type": lt, "blocks": results[i:i + len(tickers)]})
+        i += len(tickers)
+    return sections
+
+
+def daily_text(sections):
+    out = []
+    for idx, sec in enumerate(sections):
+        if idx:
+            out.append("-" * 32)
+        if sec["title"]:
+            out.append(sec["title"])
+        for b in sec["blocks"]:
+            out.append(b["ticker"])
+            out.append(b["tv"] or f"error: {b['error']}")
+            out.append("")
+    return "\n".join(out).rstrip() + "\n"
+
+
+@app.get("/daily")
+def daily():
+    if not MENTHORQ_KEY:
+        return Response("MENTHORQ_API_KEY env var is not set on the server\n",
+                        status=500, mimetype="text/plain")
+    sections = build_daily_sections()
+    text = daily_text(sections)
+    # curl (or ?format=txt) gets the raw import strings; browsers get the page
+    wants_html = "text/html" in request.headers.get("Accept", "")
+    if request.args.get("format") == "txt" or not wants_html:
+        return Response(text, mimetype="text/plain")
+    day = next((b["date"] for s in sections for b in s["blocks"] if b["date"]), None)
+    return render_template("daily.html", sections=sections, full_text=text, day=day)
 
 
 # =========================================================================
